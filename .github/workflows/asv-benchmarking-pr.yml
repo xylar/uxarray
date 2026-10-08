@@ -1,0 +1,88 @@
+name: ASV Benchmarking (PR)
+
+# This workflow runs untrusted fork code, so it only gets a read-only token and
+# no write access. It must NOT post comments itself (forks get a read-only token
+# -> 403). Instead it uploads the results + PR number as an artifact, and the
+# separate asv-benchmarking-comment.yml (triggered via workflow_run) posts the
+# comment with the repo's write token. See issue #1547.
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled]
+  workflow_dispatch:
+
+env:
+  PR_HEAD_LABEL: ${{ github.event.pull_request.head.label }}
+
+jobs:
+  benchmark:
+    if: ${{ contains(github.event.pull_request.labels.*.name, 'run-benchmark') && github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+    name: Linux
+    runs-on: ubuntu-latest
+    env:
+      ASV_DIR: "./benchmarks"
+      CONDA_ENV_FILE: ci/environment.yml
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+
+      - name: Record CPU topology
+        run: |
+          # A diagnostic; never fail the job over it.
+          lscpu | grep -E 'Model name|^CPU\(s\):|Thread\(s\) per core|Core\(s\) per socket|Socket\(s\)|CPU max MHz' || lscpu || true
+
+      - name: Set up Conda environment
+        uses: mamba-org/setup-micromamba@v3
+        with:
+          environment-file: ${{env.CONDA_ENV_FILE}}
+          cache-environment: true
+          environment-name: uxarray_build
+          cache-environment-key: "${{runner.os}}-${{runner.arch}}-py${{env.PYTHON_VERSION}}-${{env.TODAY}}-${{hashFiles(env.CONDA_ENV_FILE)}}-benchmark"
+          create-args: >-
+            asv
+            python-build
+            mamba
+
+      # asv rebuilds its own env under benchmarks/env/ each run; caching skips the
+      # solve. No restore-keys: asv reuses a restored env without checking it.
+      - name: Cache asv environment
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.ASV_DIR }}/env
+          key: "asv-env-${{runner.os}}-${{runner.arch}}-${{hashFiles(env.CONDA_ENV_FILE, 'benchmarks/asv.conf.json')}}"
+
+      - name: Run Benchmarks
+        shell: bash -l {0}
+        id: benchmark
+        run: |
+          set -x
+          # Fill the fixture cache before asv preimports the suite, which would otherwise build it serially in the forkserver parent
+          (cd .. && python -m benchmarks.helpers._fixtures)
+          # ID this runner
+          asv machine --yes
+          echo "Baseline:  ${{ github.event.pull_request.base.sha }} (${{ github.event.pull_request.base.label }})"
+          echo "Contender: ${GITHUB_SHA} ($PR_HEAD_LABEL)"
+          # Run benchmarks for current commit against base
+          ASV_OPTIONS="--split --show-stderr"
+          asv continuous $ASV_OPTIONS ${{ github.event.pull_request.base.sha }} ${GITHUB_SHA}
+          # Save compare results
+          asv compare --split ${{ github.event.pull_request.base.sha }} ${GITHUB_SHA} > asv_compare_results.txt
+        working-directory: ${{ env.ASV_DIR }}
+
+      - name: Save PR number
+        if: always()
+        run: echo "${{ github.event.pull_request.number }}" > ${{ env.ASV_DIR }}/pr_number.txt
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: asv-benchmark-results-${{ runner.os }}
+          path: |
+            ${{ env.ASV_DIR }}/results
+            ${{ env.ASV_DIR }}/asv_compare_results.txt
+            ${{ env.ASV_DIR }}/pr_number.txt

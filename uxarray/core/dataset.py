@@ -1,0 +1,995 @@
+from __future__ import annotations
+
+import os
+import sys
+from html import escape
+from typing import IO, Any, Hashable, Iterable, Mapping
+from warnings import warn
+
+import xarray as xr
+from xarray.core import dtypes
+from xarray.core.options import OPTIONS
+from xarray.core.utils import UncachedAccessor
+
+from uxarray.constants import GRID_DIMS
+from uxarray.core.arithmetic import UxSupportsArithmetic
+from uxarray.core.dataarray import UxDataArray
+from uxarray.core.utils import (
+    _map_dims_to_ugrid,
+    _open_dataset_with_fallback,
+    _resolve_coordinate_labels_to_indices,
+    _validate_indexers,
+)
+from uxarray.errors import DimensionError, GridInvalidError
+from uxarray.formatting_html import dataset_repr
+from uxarray.grid import Grid
+from uxarray.grid.dual import construct_dual
+from uxarray.grid.neighbors import DatasetNeighborhood
+from uxarray.grid.validation import _check_duplicate_nodes_indices
+from uxarray.io._healpix import get_zoom_from_cells
+from uxarray.plot.accessor import UxDatasetPlotAccessor
+from uxarray.remap.accessor import RemapAccessor
+from uxarray.utils.coords import (
+    _assert_grid_dim_coord_consistent_if_in_both,
+    _assign_grid_dim_indexer_coords_if_appropriate,
+    _crash_if_1d_xarray_indexer_dim_in_uxarray_obj,
+)
+
+
+class UxDataset(UxSupportsArithmetic, xr.Dataset):
+    """Grid informed ``xarray.Dataset`` with an attached ``Grid`` accessor and
+    grid-specific functionality.
+
+    Parameters
+    ----------
+    uxgrid : uxarray.Grid, optional
+        The ``Grid`` object that makes this dataset aware of the unstructured
+        grid topology it belongs to.
+        Providing `None` is possible but intended for internal use only;
+        if `None`, must set self.uxgrid before using any grid-aware methods.
+
+    Other Parameters
+    ----------------
+    *args:
+        Arguments for the ``xarray.Dataset`` class
+    **kwargs:
+        Keyword arguments for the ``xarray.Dataset`` class
+
+    Notes
+    -----
+    See `xarray.Dataset <https://docs.xarray.dev/en/stable/generated/xarray.Dataset.html>`__
+    for further information about Datasets.
+
+    Grid-Aware Accessor Methods
+    ---------------------------
+    The following methods return specialized accessors that preserve grid information:
+
+    - ``groupby``: Groups data by dimension/coordinate
+    - ``groupby_bins``: Groups data by bins
+    - ``resample``: Resamples timeseries data
+    - ``rolling``: Rolling window operations
+    - ``coarsen``: Coarsens data by integer factors
+    - ``weighted``: Weighted operations
+    - ``rolling_exp``: Exponentially weighted rolling (requires numbagg)
+    - ``cumulative``: Cumulative operations
+
+    All these methods work identically to xarray but maintain the uxgrid attribute
+    throughout operations.
+    """
+
+    # expected instance attributes, required for subclassing with xarray (as of v0.13.0)
+    __slots__ = (
+        "_uxgrid",
+        "_source_datasets",
+    )
+
+    def __init__(
+        self,
+        *args,
+        uxgrid: Grid | None = None,
+        source_datasets: str | None = None,
+        **kwargs,
+    ):
+        # Note: allowing uxgrid=None is not desirable (see issue #1620)
+        #   but it is the default, to simplify subclassing from xarray.
+        # E.g., self.isel() uses self._replace(), which goes to xarray.Dataset._replace(),
+        #   which returns type(self)(...) with explicit kwargs only (no **kwargs),
+        #   making it very challenging to pass uxgrid at time of construction.
+        # Workaround here: clarified in docstring, and allow initial uxgrid=None,
+        #   but crash with GridInvalidError upon accessing self.uxgrid, if still None.
+
+        # Need self._uxgrid if None; self.uxgrid ensures value is actually a Grid.
+        if uxgrid is None:
+            self._uxgrid = uxgrid
+        else:
+            self.uxgrid = uxgrid
+
+        self._source_datasets = source_datasets
+
+        # As of xarray's 2026.4.0, `xr.Dataset(xr.Dataset)` is prohibited;
+        # hence this check, i.e. if we get `xr.Dataset` as input, use its `data_vars`
+        # as `dict` and handle `coords` and `attrs` properly as well
+        if args and isinstance(args[0], xr.Dataset):
+            ds = args[0]
+            # Replacee only args[0], `ds`, with `ds.data_vars` as `dict`
+            args = (dict(ds.data_vars),) + args[1:]
+            # coords not passed positionally
+            if len(args) < 2:
+                kwargs.setdefault(
+                    "coords", dict(ds.coords)
+                )  # Set it as kwarg only if not explicitly provided
+            # attrs not passed positionally
+            if len(args) < 3:
+                kwargs.setdefault(
+                    "attrs", ds.attrs
+                )  # Set it as kwarg only if not explicitly provided
+
+        super().__init__(*args, **kwargs)
+
+    # declare plotting accessor
+    plot = UncachedAccessor(UxDatasetPlotAccessor)
+    remap = UncachedAccessor(RemapAccessor)
+
+    def _repr_html_(self) -> str:
+        if OPTIONS["display_style"] == "text":
+            return f"<pre>{escape(repr(self))}</pre>"
+        return dataset_repr(self)
+
+    def __getitem__(self, key):
+        """Override to make sure the result is an instance of
+        ``uxarray.UxDataArray`` or ``uxarray.UxDataset``."""
+
+        value = super().__getitem__(key)
+
+        if isinstance(value, xr.DataArray):
+            value = UxDataArray(value, uxgrid=self._uxgrid)
+        elif isinstance(value, xr.Dataset):
+            value = UxDataset(
+                value, uxgrid=self._uxgrid, source_datasets=self.source_datasets
+            )
+
+        return value
+
+    # def __setitem__(self, key, value):
+    #     """Override to make sure the `value` is an instance of
+    #     ``uxarray.UxDataArray``."""
+    #     if isinstance(value, xr.DataArray):
+    #         value = UxDataArray(value, uxgrid=self.uxgrid)
+    #
+    #     if isinstance(value, UxDataArray):
+    #         value = value.to_dataarray()
+    #
+    #     super().__setitem__(key, value)
+
+    @property
+    def source_datasets(self):
+        """Property to keep track of the source data sets used to instantiate
+        this ``uxarray.UxDataset``.
+
+        Can be used as metadata for diagnosis purposes.
+
+        Examples
+        --------
+        uxds = ux.open_dataset(grid_path, data_path)
+        uxds.source_datasets
+        """
+        return self._source_datasets
+
+    # a setter function
+    @source_datasets.setter
+    def source_datasets(self, source_datasets_input):
+        self._source_datasets = source_datasets_input
+
+    @property
+    def uxgrid(self) -> Grid:
+        """Linked unstructured grid (``uxarray.Grid``) which the data resides on."""
+        # _uxgrid=None should only cause crash during grid-aware operations.
+        # So, internally: use self._uxgrid for non-grid-aware operations like _copy() or _replace(),
+        # but self.uxgrid for everything else, like integrate().
+        if self._uxgrid is None:
+            # (comment in self.__init__ describes why this possibility exists.)
+            raise GridInvalidError(
+                f"Expected a uxarray.Grid; got {type(self).__name__}.uxgrid = None. "
+                "Maybe you forgot to provide uxgrid when initializing this UxDataset?"
+            )
+        return self._uxgrid
+
+    @uxgrid.setter
+    def uxgrid(self, ugrid_obj: Grid):
+        if not isinstance(ugrid_obj, Grid):
+            raise TypeError(
+                f"Expected a uxarray.Grid; got value of type={type(ugrid_obj)} "
+                f"(while setting {type(self).__name__}.uxgrid = value)."
+            )
+        self._uxgrid = ugrid_obj
+
+    def _calculate_binary_op(self, *args, **kwargs):
+        """Override to make the result a complete instance of
+        ``uxarray.UxDataset``."""
+        ds = super()._calculate_binary_op(*args, **kwargs)
+
+        if isinstance(ds, UxDataset):
+            ds._uxgrid = self._uxgrid
+            ds.source_datasets = self.source_datasets
+        else:
+            ds = UxDataset(
+                ds, uxgrid=self._uxgrid, source_datasets=self.source_datasets
+            )
+
+        return ds
+
+    def _construct_dataarray(self, name) -> UxDataArray:
+        """Override to make the result an instance of
+        ``uxarray.UxDataArray``."""
+        xarr = super()._construct_dataarray(name)
+        return UxDataArray(xarr, uxgrid=self._uxgrid)
+
+    @classmethod
+    def _construct_direct(cls, *args, **kwargs):
+        """Override to make the result an ``uxarray.UxDataset`` class."""
+
+        return cls(xr.Dataset._construct_direct(*args, **kwargs))
+
+    def _copy(self, **kwargs):
+        """Override to make the result a complete instance of
+        ``uxarray.UxDataset``."""
+        copied = super()._copy(**kwargs)
+
+        deep = kwargs.get("deep", None)
+
+        if deep:
+            # Reinitialize the uxgrid assessor
+            copied._uxgrid = self._uxgrid.copy()  # deep copy
+        else:
+            # Point to the existing uxgrid object
+            copied._uxgrid = self._uxgrid
+
+        return copied
+
+    def _replace(self, *args, **kwargs):
+        """Override to make the result a complete instance of
+        ``uxarray.UxDataset``."""
+        ds = super()._replace(*args, **kwargs)
+
+        if isinstance(ds, UxDataset):
+            ds._uxgrid = self._uxgrid
+            ds.source_datasets = self.source_datasets
+        else:
+            ds = UxDataset(
+                ds, uxgrid=self._uxgrid, source_datasets=self.source_datasets
+            )
+
+        return ds
+
+    @classmethod
+    def from_dataframe(cls, dataframe):
+        """Override to make the result a ``uxarray.UxDataset`` class."""
+
+        return cls(
+            {col: ("index", dataframe[col].values) for col in dataframe.columns},
+            coords={"index": dataframe.index},
+        )
+
+    @classmethod
+    def from_dict(cls, data, **kwargs):
+        """Override to make the result a ``uxarray.UxDataset`` class."""
+
+        return cls(
+            {key: ("index", val) for key, val in data.items()},
+            coords={"index": range(len(next(iter(data.values()))))},
+            **kwargs,
+        )
+
+    @classmethod
+    def from_structured(cls, ds: xr.Dataset):
+        """Converts a structured ``xarray.Dataset`` into an unstructured ``uxarray.UxDataset``
+
+        Parameters
+        ----------
+        ds : xr.Dataset
+            The structured `xarray.Dataset` to convert. Must contain longitude and latitude variables consistent
+            with the CF-conventions
+
+        tol : float, optional
+            Tolerance for considering nodes as identical when constructing the grid from longitude and latitude.
+            Default is `1e-10`.
+
+        Returns
+        -------
+        UxDataset
+            An instance of `uxarray.UxDataset`
+        """
+        from uxarray import Grid
+
+        uxgrid = Grid.from_dataset(ds)
+
+        ds = _map_dims_to_ugrid(ds, uxgrid._source_dims_dict, uxgrid)
+
+        # Drop spatial coordinates
+        coords_to_drop = [
+            coord for coord, da_coord in ds.coords.items() if "n_face" in da_coord.dims
+        ]
+        ds = ds.drop_vars(coords_to_drop)
+
+        return cls(ds, uxgrid=uxgrid)
+
+    @classmethod
+    def from_xarray(cls, ds: xr.Dataset, uxgrid: Grid = None, ugrid_dims: dict = None):
+        """
+        Converts a ``xarray.Dataset`` into a ``uxarray.UxDataset``, paired with either a user-defined or
+        parsed ``Grid``
+
+        Parameters
+        ----------
+        ds: xr.Dataset
+            An Xarray dataset containing data residing on an unstructured grid
+        uxgrid: Grid, optional
+            ``Grid`` object representing an unstructured grid. If a grid is not provided, the source ds will be
+            parsed to see if a ``Grid`` can be constructed.
+        ugrid_dims: dict, optional
+            A dictionary mapping dataset dimensions to UGRID dimensions.
+
+        Returns
+        -------
+        cls
+            A ``ux.UxDataset`` with data from the ``xr.Dataset` paired with a ``ux.Grid``
+        """
+        if uxgrid is not None:
+            if ugrid_dims is None and uxgrid._source_dims_dict is not None:
+                ugrid_dims = uxgrid._source_dims_dict
+            # Grid is provided,
+        else:
+            # parse
+            uxgrid = Grid.from_dataset(ds)
+            ugrid_dims = uxgrid._source_dims_dict
+
+        # map each dimension to its UGRID equivalent
+        ds = _map_dims_to_ugrid(ds, ugrid_dims, uxgrid)
+
+        return cls(ds, uxgrid=uxgrid)
+
+    @classmethod
+    def from_healpix(
+        cls,
+        ds: str | os.PathLike | xr.Dataset,
+        pixels_only: bool = True,
+        face_dim: str = "cell",
+        **kwargs,
+    ):
+        """
+        Loads a dataset represented in the HEALPix format into a ``ux.UxDataSet``, paired
+        with a ``Grid`` containing information about the HEALPix definition.
+
+        Parameters
+        ----------
+        ds: str, os.PathLike, xr.Dataset
+            Reference to a HEALPix Dataset
+        pixels_only : bool, optional
+            Whether to only compute pixels (`face_lon`, `face_lat`) or to also construct boundaries (`face_node_connectivity`, `node_lon`, `node_lat`)
+        face_dim: str, optional
+            Data dimension corresponding to the HEALPix face mapping. Typically, is set to "cell", but may differ.
+
+        Returns
+        -------
+        cls
+            A ``ux.UxDataset`` instance
+        """
+
+        if not isinstance(ds, xr.Dataset):
+            ds = _open_dataset_with_fallback(ds, **kwargs)
+
+        if face_dim not in ds.dims:
+            raise DimensionError(
+                f"face_dim={face_dim!r} is not present in the provided dataset, which has dims {ds.dims}. "
+                "Please set face_dim to the dimension corresponding to the HEALPix face mapping "
+                "(typically 'cell', but could be something else)."
+            )
+
+        # Attach a HEALPix Grid
+        uxgrid = Grid.from_healpix(
+            zoom=get_zoom_from_cells(ds.sizes[face_dim]),
+            pixels_only=pixels_only,
+            **kwargs,
+        )
+
+        return cls.from_xarray(ds, uxgrid, {face_dim: "n_face"})
+
+    def _slice_from_grid(self, sliced_grid):
+        """returns UxDataset based on slicing self according to sliced_grid.
+        sliced_grid should be a ``Grid`` which came directly from self.uxgrid.isel(...)
+        (or from slicing something equal to self.uxgrid), else behavior is undefined.
+        """
+        data_vars = {}
+        for name, da in self.data_vars.items():
+            if hasattr(da, "_slice_from_grid") and any(
+                dim in da.dims for dim in GRID_DIMS
+            ):
+                data_vars[name] = da._slice_from_grid(sliced_grid)
+            else:
+                data_vars[name] = da
+
+        # Also account for any coords which aren't attached to any data_var:
+        bonus_coords = {}
+        for coord in self.coords:
+            for data_var in data_vars.values():
+                if coord in data_var.coords:
+                    break
+            else:  # didn't break
+                da = self.coords[coord]
+                if hasattr(da, "_slice_from_grid") and any(
+                    dim in da.dims for dim in GRID_DIMS
+                ):
+                    bonus_coords[coord] = da._slice_from_grid(sliced_grid)
+                else:
+                    bonus_coords[coord] = da
+
+        ds_sliced = xr.Dataset(
+            data_vars=data_vars, coords=bonus_coords, attrs=self.attrs
+        )
+        return type(self)(ds_sliced, uxgrid=sliced_grid)
+
+    def isel(
+        self,
+        indexers: Mapping[Any, Any] | None = None,
+        drop: bool = False,
+        missing_dims: str = "raise",
+        ignore_grid: bool = False,
+        inverse_indices: bool = False,
+        **indexers_kwargs,
+    ):
+        """Return a new UxDataset with arrays indexed along the specified dimension(s).
+        Each data array is indexed appropriately,
+        along with the underlying grid when applicable.
+
+        Grid dimensions ('n_node', 'n_edge', 'n_face') are treated specially
+        when `ignore_grid=False` (this is the default). Any one of them can be indexed,
+        regardless of data location, and the result will be sliced to form the minimal grid
+        of faces containing all the nodes, edges, or faces specified. For example,
+        using n_edge=7 selects just the two faces touching edge 7. For data on 'n_face',
+        the result would have 'n_face' with just those two faces. For data on 'n_edge',
+        the result would have 'n_edge' with all edges located on either of those two faces.
+
+        Grid dimension indexers cannot have more than 1 dimension (such as a 2D DataArray).
+        Grid dimensions are never renamed (even if indexed by 1D DataArray with different dim name).
+        Grid dimension indexer cannot have a non-grid dimension which exists in the original UxDataset.
+
+        Parameters
+        ----------
+        indexers : dict, optional
+            A dict with keys matching dimensions and values given
+            by integers, slice objects or arrays.
+            indexer can be a integer, slice, array-like or DataArray.
+            If DataArrays are passed as indexers, xarray-style indexing will be
+            carried out. See :ref:`indexing` for the details.
+            One of indexers or indexers_kwargs must be provided.
+        drop : bool, default: False
+            If ``drop=True``, drop coordinates variables indexed by integers
+            instead of making them scalar.
+        missing_dims : {"raise", "warn", "ignore"}, default: "raise"
+            What to do if dimensions that should be selected from are not present in the
+            UxDataset:
+            - "raise": raise an exception
+            - "warn": raise a warning, and ignore the missing dimensions
+            - "ignore": ignore the missing dimensions
+        ignore_grid : bool, default=False
+            If False (default), slice the underlying UXarray grid appropriately too,
+            ensuring the resulting data actually lies on the result's underlying grid.
+            If True, slice the data only; attach self.uxgrid to the result, unchanged.
+            CAUTION: using ignore_grid=True will cause the result's data to be
+            inconsistent with its underlying grid, if any grid dimensions were sliced.
+        inverse_indices : bool, default=False
+            For grid-based slicing, pass this flag to `Grid.isel` to invert indices
+            when selecting (useful for staggering or reversing order).
+        **indexers_kwargs : dimension=indexer pairs, optional
+            The keyword arguments form of `indexers`.
+
+        Returns
+        -------
+        UxDataset
+            A new UxDataset indexed according to `indexers` and updated grid if applicable.
+            If indexer DataArrays have coordinates that do not conflict with
+            this object, then these coordinates will be attached,
+            except that 1D coordinates of indexers applied along a grid dimension will
+            only be included if it is 'n_face' and the data also has 'n_face' dimension.
+
+        Raises
+        ------
+        DimensionError (subclass of ValueError)
+            If more than one grid dimension is selected and `ignore_grid=False`.
+        ValueError
+            If parameters are invalid for xarray's .isel(), such as if
+            slicing by a nonexistent dimension, or using invalid indexers.
+        """
+        indexers, grid_dims = _validate_indexers(
+            indexers, indexers_kwargs, "isel", ignore_grid
+        )
+
+        if ignore_grid or len(grid_dims) == 0:
+            # no grid dims, or ignore_grid=True --> just call xarray's isel
+            return type(self)(
+                super().isel(
+                    indexers=indexers or None,
+                    drop=drop,
+                    missing_dims=missing_dims,
+                ),
+                uxgrid=self.uxgrid,
+            )
+        elif len(grid_dims) == 1:
+            # pop off the one grid‐dim indexer
+            grid_dim = grid_dims.pop()
+            indexers = indexers.copy()  # don't modify the original dict
+            grid_indexer = indexers.pop(grid_dim)
+
+            _crash_if_1d_xarray_indexer_dim_in_uxarray_obj(self, grid_dim, grid_indexer)
+
+            sliced_grid = self.uxgrid.isel(
+                **{grid_dim: grid_indexer}, inverse_indices=inverse_indices
+            )
+
+            result = self._slice_from_grid(sliced_grid)
+
+            result = _assign_grid_dim_indexer_coords_if_appropriate(
+                result, grid_dim, grid_indexer
+            )
+
+            # if there are any remaining indexers, apply them
+            if indexers:
+                result = super(UxDataset, result).isel(
+                    indexers=indexers, drop=drop, missing_dims=missing_dims
+                )
+                # re‐wrap so the grid sticks around
+                result = type(self)(result, uxgrid=sliced_grid)
+
+            return result
+        else:  # len(grid_dims)>1; _validate_indexers should have crashed.
+            raise AssertionError("internal implementation error if reached this line")
+
+    def sel(
+        self,
+        indexers: Mapping[Any, Any] | None = None,
+        method: str | None = None,
+        tolerance: int | float | Iterable[int | float] | None = None,
+        drop: bool = False,
+        **indexers_kwargs: Any,
+    ):
+        """Returns a new dataset with each array indexed by labels, instead of indices,
+        along the specified dimension(s).
+
+        Grid dimensions ('n_node', 'n_edge', 'n_face') are treated specially. Any one of them
+        can be indexed, regardless of data location, and the result will be sliced to form the
+        minimal grid of faces containing all the nodes, edges, or faces specified. For example,
+        using n_edge=7 selects just the two faces touching edge 7. For data on 'n_face',
+        the result would have 'n_face' with just those two faces. For data on 'n_edge',
+        the result would have 'n_edge' with all edges located on either of those two faces.
+
+        Grid dimension indexers cannot have more than 1 dimension (such as a 2D DataArray).
+        Grid dimensions are never renamed (even if indexed by 1D DataArray with different dim name).
+        Grid dimension indexer cannot have a non-grid dimension which exists in the original UxDataset.
+
+        By default, grid dims do not have coordinates assigned. But, if they have
+        been assigned, `.sel()` respects them in the intuitive way. For example,
+        using `.sel(n_face=30)` for data with `n_face` coordinates [0,10,20,30,40]
+        would be equivalent to using `.isel(n_face=3)`. Meanwhile, if the data
+        does not contain the specified grid dim (as in the n_edge=7 example above),
+        it also cannot contain coordinates along that grid dim,
+        so in that case `.sel()` performs index-based selection just like `.isel()`.
+
+        Under the hood, this method is powered by using pandas's powerful Index
+        objects. This makes label based indexing essentially just as fast as
+        using integer indexing.
+
+        It also means this method uses pandas's (well documented) logic for
+        indexing. This means you can use string shortcuts for datetime indexes
+        (e.g., '2000-01' to select all values in January 2000). It also means
+        that slices are treated as inclusive of both the start and stop values,
+        unlike normal Python indexing, for any dimensions with coordinate labels.
+        (Dimensions without coordinates treat slices normally.)
+
+        Parameters
+        ----------
+        indexers : dict, optional
+            A dict with keys matching dimensions and values given
+            by scalars, slices or arrays of tick labels. For dimensions with
+            multi-index, the indexer may also be a dict-like object with keys
+            matching index level names.
+            If DataArrays are passed as indexers, xarray-style indexing will be
+            carried out (see :ref:`indexing` for the details),
+            with one exception: grid dimensions will never be renamed.
+            One of indexers or indexers_kwargs must be provided.
+        method : {None, "nearest", "pad", "ffill", "backfill", "bfill"}, optional
+            Method to use for inexact matches:
+
+            * None (default): only exact matches
+            * pad / ffill: propagate last valid index value forward
+            * backfill / bfill: propagate next valid index value backward
+            * nearest: use nearest valid index value
+
+            Can only provide ``method`` if all indexed dims actually have coords,
+            else raises ValueError (consistent with xarray sel() behavior).
+        tolerance : optional
+            Maximum distance between original and new labels for inexact
+            matches. The values of the index at the matching locations must
+            satisfy the equation ``abs(index[indexer] - target) <= tolerance``.
+            Can only provide ``tolerance`` if all indexed dims actually have coords,
+            else raises ValueError (consistent with xarray sel() behavior).
+        drop : bool, optional
+            If ``drop=True``, drop coordinates variables in `indexers` instead
+            of making them scalar.
+        **indexers_kwargs : {dim: indexer, ...}, optional
+            The keyword arguments form of ``indexers``.
+            One of indexers or indexers_kwargs must be provided.
+
+        Returns
+        -------
+        obj : UxDataset
+            A new UxDataset with the same contents as this dataset, except each
+            variable and dimension is indexed by the appropriate indexers,
+            and the uxgrid indexed appropriately as well, if indexing any grid dim.
+            If indexer DataArrays have coordinates that do not conflict with
+            this object, then these coordinates will be attached,
+            except that 1D coordinates of indexers applied along a grid dimension will
+            only be included if it is 'n_face' and the data also has 'n_face' dimension.
+            In general, each array's data will be a view of the array's data
+            in this dataset, unless indexing along a grid dimension or otherwise
+            triggering vectorized indexing by using an array indexer,
+            in which case the data will be a copy.
+        """
+        indexers, grid_dims = _validate_indexers(
+            indexers, indexers_kwargs, "sel", ignore_grid=False
+        )  # (sel doesn't support ignore_grid=True option)
+
+        if len(grid_dims) == 0:
+            # no grid dims --> just call xarray's sel
+            return type(self)(
+                self.to_xarray().sel(
+                    indexers=indexers,
+                    method=method,
+                    tolerance=tolerance,
+                    drop=drop,
+                ),
+                uxgrid=self.uxgrid,
+            )
+        elif len(grid_dims) == 1:
+            # pop off the one grid‐dim indexer
+            grid_dim = list(grid_dims)[0]
+            indexers = indexers.copy()  # don't modify the original dict
+            grid_indexer = indexers.pop(grid_dim)
+            if grid_dim in self.coords:  # label-based indexing
+                grid_indices = _resolve_coordinate_labels_to_indices(
+                    grid_dim,
+                    grid_indexer,
+                    self.coords[grid_dim],
+                    method=method,
+                    tolerance=tolerance,
+                )
+            else:  # index-based indexing
+                # crash if provided `method` or `tolerance`, as promised in docstring;
+                # (this error logic matches xarray's error logic in this case.)
+                if method is not None or tolerance is not None:
+                    raise ValueError(
+                        f"cannot supply selection options {dict(method=method, tolerance=tolerance)} "
+                        f"for dimension {grid_dim!r} that has no associated coordinate or index"
+                    )
+                grid_indices = grid_indexer
+
+            # offload the grid-indexing work to isel():
+            result = self.isel({grid_dim: grid_indices}, drop=drop)
+
+            # special case: if grid_dim in indexer and result.coords, ensure consistency.
+            # (all other coords' consistency checks already occurred in isel().)
+            _assert_grid_dim_coord_consistent_if_in_both(result, grid_dim, grid_indexer)
+
+            # index by other dims if any remain:
+            ds = result.to_xarray().sel(
+                indexers=indexers,  # (grid_dim indexer was popped)
+                method=method,
+                tolerance=tolerance,
+                drop=drop,
+            )
+
+            return type(self)(ds, uxgrid=result.uxgrid)
+        else:  # len(grid_dims)>1; _validate_indexers should have crashed.
+            raise AssertionError("internal implementation error if reached this line")
+
+    def __getattribute__(self, name):
+        """Intercept accessor method calls to return Ux-aware accessors."""
+        # Lazy import to avoid circular imports
+        from uxarray.core.accessors import DATASET_ACCESSOR_METHODS
+
+        if name in DATASET_ACCESSOR_METHODS:
+            from uxarray.core import accessors
+
+            # Get the accessor class by name
+            accessor_class = getattr(accessors, DATASET_ACCESSOR_METHODS[name])
+
+            # Get the parent method
+            parent_method = super().__getattribute__(name)
+
+            # Create a wrapper method
+            def method(*args, **kwargs):
+                # Call the parent method
+                result = parent_method(*args, **kwargs)
+                # Wrap the result with our accessor
+                return accessor_class(result, self._uxgrid, self.source_datasets)
+
+            # Copy the docstring from the parent method
+            method.__doc__ = parent_method.__doc__
+            method.__name__ = name
+
+            return method
+
+        # For all other attributes, use the default behavior
+        return super().__getattribute__(name)
+
+    def info(self, buf: IO = None, show_attrs=False) -> None:
+        """Concise summary of Dataset variables and attributes including grid
+        topology information stored in the ``uxgrid`` property.
+
+        Parameters
+        ----------
+        buf : file-like, default: sys.stdout
+            writable buffer
+        show_attrs : bool
+            Flag to select whether to show attributes
+
+        See Also
+        --------
+        pandas.DataFrame.assign
+        ncdump : netCDF's ncdump
+        """
+        if buf is None:  # pragma: no cover
+            buf = sys.stdout
+
+        lines = []
+        lines.append("uxarray.Dataset {")
+
+        lines.append("grid topology dimensions:")
+        for name, size in self.uxgrid._ds.sizes.items():
+            lines.append(f"\t{name} = {size}")
+
+        lines.append("\ngrid topology variables:")
+        for name, da in self.uxgrid._ds.variables.items():
+            dims = ", ".join(map(str, da.dims))
+            lines.append(f"\t{da.dtype} {name}({dims})")
+            if show_attrs:
+                for k, v in da.attrs.items():
+                    lines.append(f"\t\t{name}:{k} = {v}")
+
+        lines.append("\ndata dimensions:")
+        for name, size in self.sizes.items():
+            lines.append(f"\t{name} = {size}")
+
+        lines.append("\ndata variables:")
+        for name, da in self.variables.items():
+            dims = ", ".join(map(str, da.dims))
+            lines.append(f"\t{da.dtype} {name}({dims})")
+            if show_attrs:
+                for k, v in da.attrs.items():
+                    lines.append(f"\t\t{name}:{k} = {v}")
+
+        if show_attrs:
+            lines.append("\nglobal attributes:")
+            for k, v in self.attrs.items():
+                lines.append(f"\t:{k} = {v}")
+
+        lines.append("}")
+        buf.write("\n".join(lines))
+
+    def integrate(self, quadrature_rule="triangular", order=4):
+        """Integrates over all the faces of the given mesh, for every data
+        variable in the dataset.
+
+        Each data variable is integrated independently using
+        :meth:`UxDataArray.integrate`, and the results are collected into a new
+        :class:`UxDataset`. Variables whose final dimension does not map to the
+        grid (i.e. that are not face/node/edge centered) are skipped.
+
+        Parameters
+        ----------
+        quadrature_rule : str, optional
+            Quadrature rule to use. Defaults to "triangular".
+        order : int, optional
+            Order of quadrature rule. Defaults to 4.
+
+        Returns
+        -------
+        uxds : UxDataset
+            Dataset containing the integrated value of each (grid-mapped) data
+            variable.
+
+        Examples
+        --------
+        Open a UXarray dataset and integrate every data variable
+
+        >>> import uxarray as ux
+        >>> uxds = ux.open_dataset("grid.ug", "centroid_pressure_data_ug")
+        >>> integral = uxds.integrate()
+
+        Access the integral of a single variable
+
+        >>> integral["psi"]
+        """
+        integrated_vars = {}
+        skipped = []
+
+        for name, uxda in self.items():
+            try:
+                integrated_vars[name] = uxda.integrate(
+                    quadrature_rule=quadrature_rule, order=order
+                )
+            except ValueError:
+                # Variable is not mapped to the grid (or its location is not
+                # yet supported for integration); skip it rather than failing
+                # the whole dataset-wide integration.
+                skipped.append(name)
+
+        if skipped:
+            warn(
+                "The following variables were skipped during integration because "
+                "their final dimension does not map to the grid (n_face, n_node, "
+                f"or n_edge) or is not yet supported: {skipped}.",
+                UserWarning,
+            )
+
+        return UxDataset(integrated_vars, uxgrid=self.uxgrid)
+
+    def to_array(
+        self,
+        dim: Hashable = "variable",
+        name: Hashable = None,
+    ) -> UxDataArray:
+        """Convert this ``uxarray.UxDataset`` into a ``uxarray.UxDataArray``,
+        attaching this UxDataset's uxgrid to the result.
+
+        Similarly to xarray.Dataset.to_array(), the data variables will be
+        broadcast against each other and stacked along the first axis of
+        the new array. All coordinates of this dataset will remain coordinates.
+
+        Parameters
+        ----------
+        dim : Hashable, optional
+            Name of the new dimension. Defaults to "variable"
+        name : Hashable or None, optional
+            Name of the new data array.
+
+        Returns
+        -------
+        UxDataArray
+            The ``uxarray.UxDataset`` represented as a ``uxarray.UxDataArray``
+        """
+
+        xarr = super().to_array(dim=dim, name=name)
+        return UxDataArray(xarr, uxgrid=self._uxgrid)
+        # _uxgrid not uxgrid; converting to UxDataArray is not a grid-aware method.
+
+    def neighborhood(self, r: float = 1.0) -> DatasetNeighborhood:
+        """Groups every grid-mapped data variable by the elements within ``r``
+        degrees of each grid element, to be reduced over by a method of the
+        returned :class:`DatasetNeighborhood`.
+
+        Parameters
+        ----------
+        r : float, default=1.
+            Radius of the neighborhood, in degrees.
+
+        Returns
+        -------
+        DatasetNeighborhood
+            Carrying the same reductions as :meth:`UxDataArray.neighborhood`,
+            applied to every data variable at once. Each returns a
+            ``UxDataset``.
+
+        Notes
+        -----
+        Variables without a grid dimension are passed through unchanged.
+
+        Variables mapped to the same grid location share one neighbor query, so
+        reducing a dataset costs one query per location present rather than one
+        per variable.
+
+        Examples
+        --------
+        Apply a mean filter to all grid-mapped variables in a dataset:
+
+        >>> import uxarray as ux
+        >>> uxds = ux.tutorial.open_dataset("outCSne30-vortex")
+        >>> uxds_smooth = uxds.neighborhood(r=5.0).mean()
+
+        See Also
+        --------
+        UxDataArray.neighborhood : Reduce a single data variable.
+        Grid.neighborhood : Neighborhood for one grid location, without data.
+        UxDataArray.zonal_mean : Average over latitude bands.
+        UxDataArray.azimuthal_mean : Average over rings of constant great-circle distance.
+        """
+        return DatasetNeighborhood(self, r=r)
+
+    def to_xarray(self, grid_format: str = "UGRID") -> xr.Dataset:
+        """
+        Converts a ``ux.UXDataset`` to a ``xr.Dataset``.
+
+        Parameters
+        ----------
+        grid_format : str, default="UGRID"
+            The format in which to convert the grid. Supported values are "UGRID" and "HEALPix". The dimensions will
+            match the selected grid format.
+
+        Returns
+        -------
+        xr.Dataset
+            The ``ux.UXDataset`` represented as a ``xr.Dataset``
+        """
+        if grid_format == "HEALPix":
+            ds = self.rename_dims({"n_face": "cell"})
+            return xr.Dataset(ds.data_vars, coords=ds.coords, attrs=ds.attrs)
+
+        return xr.Dataset(self.data_vars, coords=self.coords, attrs=self.attrs)
+
+    def astype(self, dtype, **kw_super):
+        """Copy of this uxarray object, with data cast to a specified type.
+        Leaves coordinate dtype unchanged.
+
+        Behaves just like :meth:`xarray.Dataset.astype`, except that
+        the returned object is a UxDataset with same uxgrid as the input.
+        """
+        da = super().astype(dtype, **kw_super)
+        return type(self)(da, uxgrid=self._uxgrid)
+
+    def get_dual(self):
+        """Compute the dual mesh for a dataset, returns a new dataset object.
+
+        Returns
+        --------
+        dual : uxds
+            Dual Mesh `uxds` constructed
+        """
+
+        if _check_duplicate_nodes_indices(self.uxgrid):
+            raise GridInvalidError(
+                "Duplicate nodes found in UxDataset's uxgrid; cannot get_dual()"
+            )
+
+        if self.uxgrid.partial_sphere_coverage:
+            warn(
+                "This mesh is partial, which could cause inconsistent results and data will be lost",
+                Warning,
+            )
+
+        # Get dual mesh node face connectivity
+        dual_node_face_conn = construct_dual(grid=self.uxgrid)
+
+        # Construct dual mesh
+        dual = self.uxgrid.from_topology(
+            self.uxgrid.face_lon.values,
+            self.uxgrid.face_lat.values,
+            dual_node_face_conn,
+        )
+
+        # Initialize new dataset
+        dataset = type(self)(uxgrid=dual)
+
+        # Dictionary to swap dimensions
+        dim_map = {"n_face": "n_node", "n_node": "n_face"}
+
+        # For each data array in the dataset, reconstruct the data array with the dual mesh
+        for var in self.data_vars:
+            # Get correct dimensions for the dual
+            dims = [dim_map.get(dim, dim) for dim in self[var].dims]
+
+            # Construct the new data array
+            uxda = UxDataArray(uxgrid=dual, data=self[var].data, dims=dims, name=var)
+
+            # Add data array to dataset
+            dataset[var] = uxda
+
+        return dataset
+
+    def where(self, cond: Any, other: Any = dtypes.NA, drop: bool = False):
+        return UxDataset(self.to_xarray().where(cond, other, drop), uxgrid=self._uxgrid)
+
+    where.__doc__ = xr.Dataset.where.__doc__
+
+    def fillna(self, value: Any):
+        return UxDataset(super().fillna(value), uxgrid=self._uxgrid)
+
+    fillna.__doc__ = xr.Dataset.fillna.__doc__

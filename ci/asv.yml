@@ -1,0 +1,35 @@
+name: asv
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - cartopy<0.26   # cartopy 0.26.0 breaks some geoviews plots; see issue #1780.
+  - dask
+  - datashader
+  - geoviews
+  - holoviews
+  - matplotlib-base<3.11   # 3.11.0 breaks some plots but <3.11 is fine; see issue #1542.
+  - matplotlib-inline
+  - healpix
+  - netcdf4
+  - numba
+  - numpy
+  - pandas
+  - pathlib
+  - pre_commit
+  - polars
+  - pyarrow
+  - pytest
+  - pytest-cov
+  - requests
+  - scikit-learn
+  - scipy
+  - shapely
+  - spatialpandas
+  - geopandas
+  - xarray
+  - asv
+  - hvplot
+  - pip:
+    - antimeridian
+    - -e ../

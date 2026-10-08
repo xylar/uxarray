@@ -53,9 +53,10 @@ However, this guide might still be missing case-specific details; please do
 not hesitate to reach out to us to consult any such cases.
 
 .. note::
-    Much of the information in this guide has been co-opted from the
-    `GeoCAT <https://geocat.ucar.edu/pages/contributing.html>`_ project and
-    `Project Pythia <https://projectpythia.org/contributing.html>`_.
+    Much of the information in this guide has been co-opted from `Project
+    Pythia <https://projectpythia.org/contributing>`_ and the
+    `GeoCAT-comp <https://geocat-comp.readthedocs.io/en/stable/contrib.html>`_
+    project.
 
 1.3. Project-specific Resources
 -------------------------------
@@ -65,15 +66,17 @@ Some important UXarray resources are as follows:
 * `UXarray GitHub repository <https://github.com/UXARRAY/uxarray>`_ houses
   the open-source code base along with some significant documentation such
   as the `README <https://github.com/UXARRAY/uxarray/blob/main/README.md>`_ and
-  `UXarray draft API <https://github.com/UXARRAY/uxarray/blob/main/docs/user_api/uxarray_api.md>`_.
+  `UXarray Milestones <https://github.com/UXARRAY/uxarray/milestones>`_.
 
 * `UXarray documentation <https://uxarray.readthedocs.io/>`_
   houses significant documentation such as :ref:`quickstart`, :ref:`installation`,
-  :ref:`contributing` (i.e. this document), :ref:`examples`, :ref:`tutorials`,
-  and :ref:`api`.
+  :ref:`contributing` (i.e. this document),
+  examples (:ref:`gallery` or :ref:`userguide`),
+  :ref:`tutorials`, and :ref:`api`.
 
-* `UXarray draft API <https://github.com/UXARRAY/uxarray/blob/main/docs/user_api/uxarray_api.md>`_
-  tentatively shows the eventual list of UXarray functionalities. It is
+* `UXarray Milestones <https://github.com/UXARRAY/uxarray/milestones>`_ and
+  `UXarray Roadmap <https://github.com/orgs/UXARRAY/projects/2/views/17>`_ shows
+  UXarray's future function development milestones and roadmap. It is
   open to community feedback and inputs!
 
   - Please create a
@@ -114,7 +117,7 @@ homepage <https://git-scm.com/>`_).
     Git has lots and lots of commands, each with lots and lots of options. Even if we
     can cover some of them throughout this guide, your best friend for figuring out
     to do things with Git may be Google, and in particular
-    `StackOverflow <https://stackoverflow.com/>`_.
+    `StackOverflow <https://stackoverflow.com/questions>`_.
 
 Configure your environment to authenticate with GitHub from Git. This is a
 complicated process, so we suggest that you refer to the details in the
@@ -188,8 +191,8 @@ select an issue to work on:
 <https://github.com/UXARRAY/uxarray/issues>`_. These issues might have been
 created from either the:
 
-* `UXarray draft API
-  <https://github.com/UXARRAY/uxarray/blob/main/docs/user_api/uxarray_api.md>`_ entries,
+* `UXarray Milestones <https://github.com/UXARRAY/uxarray/milestones>`_
+  and `UXarray Roadmap <https://github.com/orgs/UXARRAY/projects/2/views/17>`_,
 * An entry in a `UXarray Discussion <https://github.com/UXARRAY/uxarray/discussions>`_
 * A feature request, bug report, or any finding of the developers or users
   as a work to-do.
@@ -309,7 +312,7 @@ development purposes. Use the following commands for this::
     $ conda env create --file ci/environment.yml
     $ conda activate uxarray_build
 
-THe above commands will use the ``environment.yml`` conda environment definition
+The above commands will use the ``environment.yml`` conda environment definition
 file that is hosted under the ``ci`` folder and create a conda environment with
 the name ``uxarray_build``. Once you activate that environment with the help of the
 second command, you will be able to develop UXarray codes in your local configuration.
@@ -514,24 +517,24 @@ as follows:
   into your Conda environment for UXarray development).
 
 * Test scripts themselves are not intended to use ``pytest`` through implementation.
-Instead, ``pytest`` should be used only for running test scripts as follows::
+  Instead, ``pytest`` should be used only for running test scripts as follows::
 
     $ pytest test/<test_script_name>.py
 
-, or::
+  , or::
 
     $ python -m pytest test/<test_script_name>.py
 
-, the latter of which will also add the current directory to ``sys.path``.
+  , the latter of which will also add the current directory to ``sys.path``.
 
-Not using ``pytest`` for implementation allows the unit tests to be also run
-by using (a number of benefits/conveniences coming from using ``pytest`` can be
-seen `here <https://docs.pytest.org/en/7.1.x/how-to/unittest.html#how-to-use-unittest-based-tests-with-pytest>`_
-though)::
+  Not using ``pytest`` for implementation allows the unit tests to be also run
+  by using (a number of benefits/conveniences coming from using ``pytest`` can be
+  seen `here <https://docs.pytest.org/en/7.1.x/how-to/unittest.html#how-to-use-unittest-based-tests-with-pytest>`_
+  though)::
 
     $ python -m unittest test/<test_script_name>.py
 
-Also, all of the test scripts can be run at once with the following command::
+  Also, all of the test scripts can be run at once with the following command::
 
     $ pytest test
 
@@ -540,7 +543,7 @@ Also, all of the test scripts can be run at once with the following command::
   the test scripts.
 
 * Reference results (i.e. expected output or ground truth for not all but the most cases)
-should not be magic values (i.e. they need to be justified and/or documented).
+  should not be magic values (i.e. they need to be justified and/or documented).
 
 * Recommended, but not mandatory, implementation approach is as follows:
 
@@ -601,26 +604,18 @@ The docstrings must contain:
 ~~~~~~~~~~~~~~~~~~~~~~
 
 As we mentioned a few times throughout this guide, UXarray has a static `documentation
-<https://uxarray.readthedocs.io/>`_ :ref:`index` page that is being generated automatically from the
+<https://uxarray.readthedocs.io/>`_ page that is being generated automatically from the
 repository's code structure. However, there needs to be some manual additions to the
 proper documentation index file(s) for the automation to work.
 
-The index files ``docs/user_api/index.rst`` and ``docs/internal_api/index.rst`` (paths
-relative from the root directory) are used for UXarray documentation to allow the
-`User API <user_api/index.rst>`_ and `Internal API <internal_api/index.rst>`_,
-respectively, to be automatically generated.
+The index file ``docs/user_api/index.rst`` (path relative from the root directory) is
+used for automatically generating the `User API <api.rst>`_ documentation.
 
 That being said, the code changes, which might be a new function implementation or some
 modifications to existing ones, must be added to the appropriate ``index.rst``
 file so that its documentation page is automatically generated.
 
-.. caution::
-    Please also ensure that you are changing the `UXarray draft API
-    <https://github.com/UXARRAY/uxarray/blob/main/docs/user_api/uxarray_api.md>`_
-    accordingly if you are proposing changes to the API (e.g. new functions/attributes,
-    modification(s) to existing functions, etc.)
-
-3.7.3.5. Usage examples
+3.7.3.4. Usage examples
 ~~~~~~~~~~~~~~~~~~~~~~~
 
 .. note::
@@ -628,10 +623,23 @@ file so that its documentation page is automatically generated.
     needed. However, it would be a great practice to provide usage examples in the
     same PR, especially for demonstrating the use of complex UXarray functions.
 
-The UXarray documentation houses ``examples/<example-name>.ipynb`` files (paths
-relative from the root directory) to provide `Usage Examples <examples.rst>`_ to be
-automatically generated. If you prefer to provide usage examples for the work you
-have put together, please be sure to put your notebook(s) under this same directory.
+The UXarray documentation pages are built from a combination of ``.rst`` and ``.ipynb`` files.
+Jupyter notebook files should be cleared of all outputs before committing, and will be run and
+linked in the docs automatically when when the docs pages are built, as long as there is
+at least one reference to them in the appropriate ``.rst`` file(s).
+
+To add a usage example to the `Gallery <gallery.rst>`_, be sure to
+put the notebook file into the ``docs/examples/`` directory,
+add a reference to it in both the ``docs/gallery.rst`` and ``docs/gallery.yml`` files,
+and add a thumbnail photo into ``docs/_static/thumbnails/``.
+
+To add a page to the `User Guide <userguide.rst>`_, be sure to
+put the notebook file into the ``docs/user-guide/`` directory,
+and add a reference to it in the ``docs/userguide.rst`` file.
+
+To add a page to the `Getting Started / Quick Start Guide <quickstart.rst>`_, be sure to
+put the notebook file into the ``docs/getting-started/`` directory,
+and add a reference to it in the ``docs/quickstart.rst`` file.
 
 3.7.4. After You Open The Pull Request
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

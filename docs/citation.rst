@@ -2,17 +2,41 @@
 
 .. _citation:
 
-How to Cite Uxarray
+How to Cite UXarray
 ===================
 
-Cite Uxarray using the following text:
+Cite UXarray using the following text:
 
-**UXARRAY Organization. (Year).
-Uxarray (version \<version\>) [Software].
+**UXarray Organization. (Year).
+UXarray (version \<version\>) [Software].
 Project Raijin & Project SEATS. doi:10.5281/zenodo.<doi-part-per-version>.**
 
-Update the year, Uxarray version, and DOI part for UXarray version as appropriate. For example:
+Update the year, UXarray version, and DOI part for UXarray version as appropriate.
 
-**UXARRAY Organization. (2021).
-Uxarray (version 0.0.2) [Software].
-Project Raijin & Project SEATS. doi:10.5281/zenodo.5658256.**
+Cite all versions? You can cite all versions by using the DOI `10.5281/zenodo.5655065
+<https://doi.org/10.5281/zenodo.5655065>`_. This DOI represents all versions, and it will
+always resolve to the latest one. `Read more <https://zenodo.org/help/versioning>`_.
+
+However, if you are interested in citing a specific version of the package, go to `all versions
+<https://zenodo.org/search?q=parent.id%3A5655065&f=allversions%3Atrue&l=list&p=1&s=10&sort=version>`_ ,
+open the version you want to cite, and check out the "Details" section on the right
+sidebar to find DOI, and use the <doi-part-per-version> from that.
+
+For example:
+
+**UXarray Organization. (2021).
+UXarray (version 2025.06.0) [Software].
+Project Raijin & Project SEATS. doi:10.5281/zenodo.15757812.**
+
+.. admonition:: Algorithm-Level Citations
+
+   Several algorithms in UXarray (e.g., spherical geometry, regridding, etc.)
+   implement methods from peer-reviewed publications. Citing them, in addition to
+   or instead of citing UXarray as a software tool via Zenodo, may be needed in
+   your case. Please visit our :doc:`Algorithm-Level Citations <citations-for-algorithms>`
+   page for detailed information and the list of our publications.
+
+.. toctree::
+   :hidden:
+
+   citations-for-algorithms

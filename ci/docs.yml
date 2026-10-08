@@ -2,24 +2,43 @@ name: uxarray-docs
 channels:
     - conda-forge
 dependencies:
-    - python=3.9
+    - python
     - dask
+    - cmocean
     - netcdf4
     - numba
-    # pinning the numpy version for numba compatibility
     - numpy
     - pathlib
     - pre_commit
     - pytest
     - pytest-cov
     - scipy
+    - healpix
     - xarray
     - pip
     - ipykernel
     - ipython
     - jupyter_client
-    - matplotlib-base
+    - scikit-learn
+    - sphinx<8.2
     - sphinx-book-theme
+    - sphinx-autosummary-accessors
+    - sphinx-remove-toctrees
+    - sphinx-copybutton
     - myst-nb
     - sphinx-design
     - nbsphinx
+    - matplotlib-base<3.11   # 3.11.0 breaks some plots but <3.11 is fine; see issue #1542.
+    - matplotlib-inline
+    - shapely
+    - hvplot
+    - holoviews
+    - geoviews
+    - cartopy<0.26   # cartopy 0.26.0 breaks some geoviews plots; see issue #1780.
+    - pandas
+    - geocat-datafiles
+    - spatialpandas
+    - polars
+    - geopandas
+    - pip:
+      - antimeridian

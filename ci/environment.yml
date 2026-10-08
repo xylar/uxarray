@@ -1,15 +1,37 @@
 name: uxarray_build
 channels:
   - conda-forge
+  - nodefaults
 dependencies:
+  - antimeridian
+  - cartopy<0.26   # cartopy 0.26.0 breaks some geoviews plots; see issue #1780.
   - dask
+  - datashader
+  - geoviews
+  - h5netcdf
+  - hdf5
+  - healpix
+  - holoviews
+  - hvplot
+  - hypothesis
+  - matplotlib-base<3.11   # 3.11.0 breaks some plots but <3.11 is fine; see issue #1542.
+  - matplotlib-inline
   - netcdf4
   - numba
-  # pinning the numpy version for numba compatibility
   - numpy
-  - pathlib
+  - pandas
   - pre_commit
+  - polars
+  - pyarrow
   - pytest
+  - pip
   - pytest-cov
+  - requests
+  - scikit-learn
   - scipy
+  - shapely
+  - spatialpandas
+  - pooch
+  - geopandas>=1.0
   - xarray
+  - asv

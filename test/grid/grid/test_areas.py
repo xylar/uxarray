@@ -1,0 +1,212 @@
+import numpy as np
+import numpy.testing as nt
+import pytest
+
+import uxarray as ux
+from uxarray.constants import ERROR_TOLERANCE, INT_FILL_VALUE
+
+
+def test_face_areas_calculate_total_face_area_triangle(mesh_constants):
+    """Create a uxarray grid from vertices and saves an exodus file."""
+    verts = [
+    [[0.02974582, -0.74469018, 0.66674712],
+    [0.1534193, -0.88744577, 0.43462917],
+    [0.18363692, -0.72230586, 0.66674712]]
+    ]
+
+    grid_verts = ux.open_grid(verts, latlon=False)
+
+    # validate the grid
+    assert grid_verts.validate()
+
+    # calculate area without correction
+    area_triangular = grid_verts.calculate_total_face_area(
+        quadrature_rule="triangular", order=4)
+    nt.assert_almost_equal(area_triangular, mesh_constants['TRI_AREA'], decimal=1)
+
+    # calculate area
+    area_gaussian = grid_verts.calculate_total_face_area(
+        quadrature_rule="gaussian", order=5, latitude_adjusted_area=True)
+    nt.assert_almost_equal(area_gaussian, mesh_constants['CORRECTED_TRI_AREA'], decimal=3)
+
+
+def test_calculate_total_face_area_respects_quadrature_kwargs(mesh_constants):
+    """calculate_total_face_area must honor its quadrature_rule/order/
+    latitude_adjusted_area kwargs instead of always returning the cached
+    default-parameter face areas."""
+    verts = [
+    [[0.02974582, -0.74469018, 0.66674712],
+    [0.1534193, -0.88744577, 0.43462917],
+    [0.18363692, -0.72230586, 0.66674712]]
+    ]
+
+    grid_verts = ux.open_grid(verts, latlon=False)
+
+    area_default = grid_verts.calculate_total_face_area(
+        quadrature_rule="triangular", order=4)
+    area_corrected = grid_verts.calculate_total_face_area(
+        quadrature_rule="gaussian", order=5, latitude_adjusted_area=True)
+
+    # the corrected result must actually differ from the uncorrected one
+    assert not np.isclose(area_default, area_corrected)
+    nt.assert_almost_equal(area_default, mesh_constants['TRI_AREA'], decimal=6)
+    nt.assert_almost_equal(area_corrected, mesh_constants['CORRECTED_TRI_AREA'], decimal=6)
+
+
+def test_face_areas_compute_face_areas_geoflow_small(gridpath):
+    """Checks if the GeoFlow Small can generate a face areas output."""
+    grid_geoflow = ux.open_grid(gridpath("ugrid", "geoflow-small", "grid.nc"))
+    grid_geoflow._compute_face_areas_and_jacobian()
+
+
+class TestFaceAreas:
+    def test_face_areas_calculate_total_face_area_file(self, gridpath, mesh_constants):
+        """Create a uxarray grid from vertices and saves an exodus file."""
+        area = ux.open_grid(gridpath("ugrid", "outCSne30", "outCSne30.ug")).calculate_total_face_area()
+        nt.assert_almost_equal(area, mesh_constants['MESH30_AREA'], decimal=3)
+
+    def test_face_areas_calculate_total_face_area_sphere(self, gridpath, mesh_constants):
+        """Computes the total face area of an MPAS mesh that lies on a unit sphere, with an expected total face area of 4pi."""
+        mpas_grid_path = gridpath("mpas", "QU", "mesh.QU.1920km.151026.nc")
+
+        primal_grid = ux.open_grid(mpas_grid_path, use_dual=False)
+        dual_grid = ux.open_grid(mpas_grid_path, use_dual=True)
+
+        primal_face_area = primal_grid.calculate_total_face_area()
+        dual_face_area = dual_grid.calculate_total_face_area()
+
+        nt.assert_almost_equal(primal_face_area, mesh_constants['UNIT_SPHERE_AREA'], decimal=3)
+        nt.assert_almost_equal(dual_face_area, mesh_constants['UNIT_SPHERE_AREA'], decimal=3)
+
+    def test_face_areas_verts_calc_area(self, gridpath, mesh_constants):
+        faces_verts_ndarray = np.array([
+            np.array([[150, 10, 0], [160, 20, 0], [150, 30, 0], [135, 30, 0],
+                      [125, 20, 0], [135, 10, 0]]),
+            np.array([[125, 20, 0], [135, 30, 0], [125, 60, 0], [110, 60, 0],
+                      [100, 30, 0], [105, 20, 0]]),
+            np.array([[95, 10, 0], [105, 20, 0], [100, 30, 0], [85, 30, 0],
+                      [75, 20, 0], [85, 10, 0]]),
+        ])
+        verts_grid = ux.open_grid(faces_verts_ndarray, latlon=True)
+        face_verts_areas = verts_grid.face_areas
+        nt.assert_almost_equal(face_verts_areas.sum(), mesh_constants['FACE_VERTS_AREA'], decimal=3)
+
+
+def test_latlon_bounds_populate_bounds_GCA_mix():
+    """Test bounds population with mixed GCA faces."""
+    face_1 = [[10.0, 60.0], [10.0, 10.0], [50.0, 10.0], [50.0, 60.0]]
+    face_2 = [[350, 60.0], [350, 10.0], [50.0, 10.0], [50.0, 60.0]]
+    face_3 = [[210.0, 80.0], [350.0, 60.0], [10.0, 60.0], [30.0, 80.0]]
+    face_4 = [[200.0, 80.0], [350.0, 60.0], [10.0, 60.0], [40.0, 80.0]]
+
+    faces = [face_1, face_2, face_3, face_4]
+
+    expected_bounds = [[[0.17453293, 1.07370494], [0.17453293, 0.87266463]],
+                       [[0.17453293, 1.10714872], [6.10865238, 0.87266463]],
+                       [[1.04719755, 1.57079633], [3.66519143, 0.52359878]],
+                       [[1.04719755, 1.57079633], [0., 6.28318531]]]
+
+    grid = ux.Grid.from_face_vertices(faces, latlon=True)
+    bounds_xarray = grid.bounds
+    nt.assert_allclose(bounds_xarray.values, expected_bounds, atol=ERROR_TOLERANCE)
+
+
+def test_latlon_bounds_populate_bounds_MPAS(gridpath):
+    """Test bounds population with MPAS grid."""
+    uxgrid = ux.open_grid(gridpath("mpas", "QU", "oQU480.231010.nc"))
+    bounds_xarray = uxgrid.bounds
+
+def _sum_quadrature_jacobians(x, y, z, quadrature_rule, order):
+    """Independently sum the Jacobian at each quadrature point of a triangle.
+
+    Regression test for #1645
+    """
+    node1 = np.array([x[0], y[0], z[0]])
+    node2 = np.array([x[1], y[1], z[1]])
+    node3 = np.array([x[2], y[2], z[2]])
+
+    assert quadrature_rule in ("gaussian", "triangular")
+    if quadrature_rule == "gaussian":
+        dG, dW = ux.grid.area.get_gauss_quadrature_dg(order)
+        return sum(
+            ux.grid.area._calculate_spherical_triangle_jacobian(
+                node1, node2, node3, dG[0][p], dG[0][q])
+            for p in range(len(dW)) for q in range(len(dW))
+        )
+    else:
+        dG, dW = ux.grid.area.get_tri_quadrature_dg(order)
+        return sum(
+            ux.grid.area._calculate_spherical_triangle_jacobian_barycentric(
+                node1, node2, node3, dG[p][0], dG[p][1])
+            for p in range(len(dW))
+        )
+
+@pytest.mark.parametrize("quadrature_rule, order", [("gaussian", 5), ("triangular", 4)])
+def test_calculate_face_area_jacobian_is_quadrature_sum(quadrature_rule, order):
+    """The returned jacobian must be the sum over every quadrature point.
+
+    Previously the loop did ``jacobian += jacobian`` after overwriting
+    ``jacobian`` with the value at the current point, so the result was twice
+    the *last* point rather than the running total.
+
+    Regression test for #1645
+    """
+    x = np.array([0.02974582, 0.1534193, 0.18363692])
+    y = np.array([-0.74469018, -0.88744577, -0.72230586])
+    z = np.array([0.66674712, 0.43462917, 0.66674712])
+
+    expected = _sum_quadrature_jacobians(x, y, z, quadrature_rule, order)
+
+    _, jacobian = ux.grid.area.calculate_face_area(
+        x, y, z, quadrature_rule, order, latitude_adjusted_area=False)
+
+    assert jacobian > 0
+    nt.assert_allclose(jacobian, expected, rtol=1e-12)
+
+
+def test_face_areas_fesom(gridpath):
+    """Ensure correct total area for FESOM grid (~8.3780 sr). Regression test for #425."""
+    uxgrid = ux.open_grid(gridpath("ugrid", "fesom", "fesom.mesh.diag.nc"))
+    total_area = uxgrid.calculate_total_face_area()
+    nt.assert_almost_equal(total_area, 8.3780, decimal=4)
+
+
+def test_total_face_area_healpix_uses_cached_equal_areas():
+    """Default args must reuse the cached ``face_areas``, not recompute.
+
+    HEALPix faces are exactly equal-area, so the cached sum is exactly 4*pi.
+    Recomputing via quadrature drifts and loses that property.
+    """
+    uxgrid = ux.Grid.from_healpix(zoom=2)
+
+    total_area = uxgrid.calculate_total_face_area()
+
+    nt.assert_allclose(total_area, np.sum(uxgrid.face_areas.values), rtol=0)
+    nt.assert_allclose(total_area, 4 * np.pi, rtol=1e-12)
+
+
+def test_total_face_area_honors_quadrature_kwargs():
+    """Non-default quadrature settings must still trigger a fresh computation."""
+    uxgrid = ux.Grid.from_healpix(zoom=2)
+
+    recomputed = uxgrid.calculate_total_face_area(quadrature_rule="gaussian", order=2)
+
+    nt.assert_allclose(
+        recomputed,
+        np.sum(uxgrid.compute_face_areas(quadrature_rule="gaussian", order=2)),
+        rtol=0,
+    )
+
+def test_face_area_invalid_order_crashes():
+    """spot check: using invalid values for order needs to raise ValueError"""
+    uxgrid = ux.Grid.from_healpix(zoom=2)
+    with pytest.raises(ValueError):
+        uxgrid.compute_face_areas(quadrature_rule="gaussian", order=0)
+    with pytest.raises(ValueError):
+        uxgrid.calculate_total_face_area(quadrature_rule="triangular", order=3)
+    with pytest.raises(ValueError):
+        uxgrid.compute_face_areas(quadrature_rule="triangular", order=7)
+    with pytest.raises(ValueError):
+        uxgrid.calculate_total_face_area(quadrature_rule="gaussian", order=12)
+    # 12 is valid for triangular but not for gaussian. Just ensuring this doesn't crash:
+    uxgrid.compute_face_areas(quadrature_rule="triangular", order=12)
